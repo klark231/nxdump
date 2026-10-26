@@ -1,0 +1,4 @@
+<resources>
+    <style name="Theme.NxDump" parent="android:Theme.DeviceDefault.DayNight" />
+    <color name="ic_launcher_background">#2B3A67</color>
+</resources>
