@@ -22,6 +22,7 @@ public final class Dumper {
         Job(String path, Source src, long off, long size) { this.path = path; this.src = src; this.off = off; this.size = size; }
     }
 
+    /** Header-based lookup (fallback). */
     private static Nca findProgram(List<Nca> ncas, long appId, boolean patch) {
         Nca best = null;
         for (Nca n : ncas) {
@@ -34,16 +35,33 @@ public final class Dumper {
         return best;
     }
 
+    /** Finds the program NCA via the CNMT content list; falls back to NCA header heuristics. */
+    private static Nca resolveProgram(Container c, Keys keys, long appId, boolean patch) {
+        List<Nca> ncas = c.openNcas(keys, null);
+        int kind = patch ? Analyzer.UPDATE : Analyzer.BASE;
+        for (Analyzer.Info i : Analyzer.analyze(c, keys))
+            if (i.kind == kind && i.appId == appId && i.programNca != null)
+                for (Nca n : ncas) if (n.name.equalsIgnoreCase(i.programNca)) return n;
+        Nca n = findProgram(ncas, appId, patch);
+        if (n != null) return n;
+        Nca any = null;
+        for (Nca x : ncas) {
+            if (x.contentType != Nca.TYPE_PROGRAM) continue;
+            if (patch ? x.isPatchRomFs() : !x.isPatchRomFs() && Analyzer.appIdOf(x.titleId) == appId) { any = x; break; }
+        }
+        return any;
+    }
+
     /** update may be null, or be the same Container as base (bundle NSP). */
     public static void dump(Container base, Container update, long appId, boolean exefs, boolean romfs,
                             Keys keys, Sink sink, Progress prog) throws IOException {
         base.importTickets(keys);
         if (update != null) update.importTickets(keys);
-        Nca baseProg = findProgram(base.openNcas(keys, null), appId, false);
+        Nca baseProg = resolveProgram(base, keys, appId, false);
         if (baseProg == null) throw new NxException("Base game program data not found in the selected file");
         Nca updProg = null;
         if (update != null) {
-            updProg = findProgram(update.openNcas(keys, null), appId, true);
+            updProg = resolveProgram(update, keys, appId, true);
             if (updProg == null) throw new NxException("The selected update does not belong to this game");
         }
 

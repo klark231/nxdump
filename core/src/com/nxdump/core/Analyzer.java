@@ -15,6 +15,8 @@ public final class Analyzer {
         public long titleId, appId, version;
         public String name = "", displayVersion = "", error;
         public byte[] icon;
+        /** NCA file names from the CNMT content list (lowercase hex id + .nca). */
+        public String programNca, controlNca;
     }
 
     public static long appIdOf(long titleId) { return titleId & ~0x1FFFL; }
@@ -31,8 +33,8 @@ public final class Analyzer {
                 Source d = meta.openData(meta.sections[0]);
                 byte[] cnmt = null;
                 for (Pfs.Entry e : Pfs.parse(d))
-                    if (e.name.endsWith(".cnmt")) { cnmt = d.read(e.offset, (int) Math.min(e.size, 0x40)); break; }
-                if (cnmt == null) continue;
+                    if (e.name.endsWith(".cnmt")) { cnmt = d.read(e.offset, (int) Math.min(e.size, 1 << 16)); break; }
+                if (cnmt == null || cnmt.length < 0x20) continue;
                 info.titleId = Bin.le64(cnmt, 0);
                 info.version = Bin.le32(cnmt, 8) & 0xFFFFFFFFL;
                 int type = cnmt[0xC] & 0xFF;
@@ -41,6 +43,15 @@ public final class Analyzer {
                 else if (type == Meta.TYPE_ADDON) info.kind = DLC;
                 else continue;
                 info.appId = appIdOf(info.titleId);
+                int ext = Bin.le16(cnmt, 0xE), count = Bin.le16(cnmt, 0x10);
+                for (int k = 0; k < count; k++) {
+                    int o = 0x20 + ext + k * 0x38;
+                    if (o + 0x38 > cnmt.length) break;
+                    String id = Bin.hex(java.util.Arrays.copyOfRange(cnmt, o + 0x20, o + 0x30)) + ".nca";
+                    int ct = cnmt[o + 0x36] & 0xFF;
+                    if (ct == 1 && info.programNca == null) info.programNca = id;
+                    if (ct == 3 && info.controlNca == null) info.controlNca = id;
+                }
                 if (info.kind != DLC) readControl(info, ncas);
             } catch (IOException e) {
                 info.error = e.getMessage();
@@ -57,7 +68,8 @@ public final class Analyzer {
 
     private static void readControl(Info info, List<Nca> ncas) throws IOException {
         for (Nca n : ncas) {
-            if (n.contentType != Nca.TYPE_CONTROL || n.titleId != info.titleId) continue;
+            boolean byName = info.controlNca != null && n.name.equalsIgnoreCase(info.controlNca);
+            if (!byName && (info.controlNca != null || n.contentType != Nca.TYPE_CONTROL || n.titleId != info.titleId)) continue;
             Source img = n.openData(n.sections[0]);
             RomFs.File nacp = null, icon = null;
             for (RomFs.File f : RomFs.list(img)) {
