@@ -36,8 +36,8 @@ public final class Dumper {
     }
 
     /** Finds the program NCA via the CNMT content list; falls back to NCA header heuristics. */
-    private static Nca resolveProgram(Container c, Keys keys, long appId, boolean patch) {
-        List<Nca> ncas = c.openNcas(keys, null);
+    private static Nca resolveProgram(Container c, Keys keys, long appId, boolean patch, List<String> errs) {
+        List<Nca> ncas = c.openNcas(keys, errs);
         int kind = patch ? Analyzer.UPDATE : Analyzer.BASE;
         for (Analyzer.Info i : Analyzer.analyze(c, keys))
             if (i.kind == kind && i.appId == appId && i.programNca != null)
@@ -56,13 +56,14 @@ public final class Dumper {
     public static void dump(Container base, Container update, long appId, boolean exefs, boolean romfs,
                             Keys keys, Sink sink, Progress prog) throws IOException {
         base.importTickets(keys);
+        List<String> errs = new ArrayList<>();
         if (update != null) update.importTickets(keys);
-        Nca baseProg = resolveProgram(base, keys, appId, false);
+        Nca baseProg = resolveProgram(base, keys, appId, false, errs);
         if (baseProg == null) throw new NxException("Base game program data not found in the selected file");
         Nca updProg = null;
         if (update != null) {
-            updProg = resolveProgram(update, keys, appId, true);
-            if (updProg == null) throw new NxException("The selected update does not belong to this game");
+            updProg = resolveProgram(update, keys, appId, true, errs);
+            if (updProg == null) throw new NxException("Could not find this game's program data in the update file \"" + update.fileName + "\"" + (errs.isEmpty() ? "" : " (" + errs.get(0) + ")") + ". Check the update is for this exact game and your keys are new enough.");
         }
 
         List<Job> jobs = new ArrayList<>();

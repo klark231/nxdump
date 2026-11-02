@@ -136,7 +136,7 @@ object Library {
     }
 
     // ---- cache -------------------------------------------------------------------------------
-    private fun cacheFile(ctx: Context) = File(ctx.filesDir, "library.json")
+    private fun cacheFile(ctx: Context) = File(ctx.filesDir, "library_v2.json")
     fun clearCache(ctx: Context) { cacheFile(ctx).delete() }
 
     fun loadCache(ctx: Context): List<Entry> = try {
