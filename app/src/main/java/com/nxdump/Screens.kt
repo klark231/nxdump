@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -45,6 +46,7 @@ import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -61,6 +63,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -242,7 +245,7 @@ fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
                 when (s) {
                     0 -> StepPage(
                         Icons.Default.SportsEsports, "Welcome to NxDump",
-                        "Extract ExeFS and RomFS from your own game dumps \u2014 with updates merged in. " +
+                        "Extract ExeFS, RomFS and DLC from your own game dumps \u2014 with updates merged in. " +
                             "Everything happens on your device; nothing is uploaded.",
                     )
                     1 -> StepPage(
@@ -400,7 +403,10 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
     var useUpdate by remember(g.appId) { mutableStateOf(true) }
     var sel by remember(g.appId) { mutableIntStateOf(0) }
     val hasUpdate = g.updates.isNotEmpty()
-    val canRun = (exefs || romfs) && vm.outputName != null
+    var dlcOn by remember(g.appId) { mutableStateOf(false) }
+    var dlcSel by remember(g.appId, g.dlc.map { it.titleId }) { mutableStateOf(g.dlc.map { it.titleId }.toSet()) }
+    val dlcPicked = g.dlc.filter { it.titleId in dlcSel }
+    val canRun = (exefs || romfs || (dlcOn && dlcPicked.isNotEmpty())) && vm.outputName != null
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
         Column(
@@ -441,6 +447,34 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
                 )
             }
             TextButton(onClick = pickers.addFile) { Text(if (hasUpdate) "Add another update\u2026" else "Add update file\u2026") }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            if (g.dlc.isNotEmpty()) {
+                OptionRow(
+                    "DLC", "${g.dlc.size} add-on content pack${if (g.dlc.size == 1) "" else "s"} found \u2014 extracted as RomFS",
+                    dlcOn,
+                ) { dlcOn = it }
+                if (dlcOn) {
+                    g.dlc.forEach { d ->
+                        val checked = d.titleId in dlcSel
+                        ListItem(
+                            headlineContent = { Text(d.name, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = { Text("%016X \u00B7 v${d.version} \u00B7 ${fmtSize(d.size)}".format(d.titleId)) },
+                            leadingContent = {
+                                Checkbox(checked, { dlcSel = if (it) dlcSel + d.titleId else dlcSel - d.titleId })
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                            modifier = Modifier.clickable { dlcSel = if (checked) dlcSel - d.titleId else dlcSel + d.titleId },
+                        )
+                    }
+                }
+            } else {
+                Text(
+                    "No DLC found for this game. Add the DLC NSP to extract it.",
+                    Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            TextButton(onClick = pickers.addFile) { Text(if (g.dlc.isNotEmpty()) "Add more DLC\u2026" else "Add DLC file\u2026") }
             Spacer(Modifier.height(4.dp))
             if (vm.outputName == null) {
                 OutlinedButton(onClick = pickers.outputFolder, modifier = Modifier.fillMaxWidth()) { Text("Choose output folder first") }
@@ -452,7 +486,11 @@ fun GameSheet(vm: AppViewModel, g: Game, pickers: Pickers, onDismiss: () -> Unit
             }
             Button(
                 onClick = {
-                    vm.extract(g, exefs, romfs, if (hasUpdate && useUpdate) g.updates[minOf(sel, g.updates.size - 1)] else null)
+                    vm.extract(
+                        g, exefs, romfs,
+                        if ((exefs || romfs) && hasUpdate && useUpdate) g.updates[minOf(sel, g.updates.size - 1)] else null,
+                        if (dlcOn) dlcPicked else emptyList(),
+                    )
                     onDismiss()
                 },
                 enabled = canRun, modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -551,6 +589,17 @@ fun SettingsScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState)
             PickerCard("Game folder", "Not set", vm.gamesName, "Change", pickers.gamesFolder)
             if (vm.gamesName != null) TextButton(onClick = { vm.clearGamesFolder() }) { Text("Remove game folder") }
             PickerCard("Output folder", "Not set", vm.outputName, "Change", pickers.outputFolder)
+            SectionLabel("Performance")
+            Text("Parallel jobs: ${vm.jobs}", style = MaterialTheme.typography.titleMedium)
+            if (vm.maxJobs > 1) Slider(
+                value = vm.jobs.toFloat(), onValueChange = { vm.changeJobs(it.toInt().coerceIn(1, vm.maxJobs)) },
+                valueRange = 1f..vm.maxJobs.toFloat(), steps = (vm.maxJobs - 2).coerceAtLeast(0),
+            )
+            Text(
+                "How many files are extracted at the same time. Big files are also decrypted ahead while the previous part is " +
+                    "being written. Lower it if extraction stalls, your phone gets hot, or your storage can't keep up.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             SectionLabel("Library")
             ListItem(
                 headlineContent = { Text("Individually added files") },
@@ -563,7 +612,7 @@ fun SettingsScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState)
             }
             SectionLabel("About")
             Text(
-                "NxDump extracts ExeFS and RomFS from XCI / NSP / NCA files you own. Keys never leave your device. " +
+                "NxDump extracts ExeFS, RomFS and DLC from XCI / NSP / NCA files you own. Keys never leave your device. " +
                     "Compressed NSZ/XCZ files are not supported.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

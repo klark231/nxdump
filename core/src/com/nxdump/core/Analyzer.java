@@ -17,6 +17,8 @@ public final class Analyzer {
         public byte[] icon;
         /** NCA file names from the CNMT content list (lowercase hex id + .nca). */
         public String programNca, controlNca;
+        /** NCA file names of the Data contents (DLC RomFS payloads), in CNMT order. */
+        public final List<String> dataNcas = new ArrayList<>();
     }
 
     public static long appIdOf(long titleId) { return titleId & ~0x1FFFL; }
@@ -51,6 +53,7 @@ public final class Analyzer {
                     int ct = cnmt[o + 0x36] & 0xFF;
                     if (ct == 1 && info.programNca == null) info.programNca = id;
                     if (ct == 3 && info.controlNca == null) info.controlNca = id;
+                    if (ct == 2) info.dataNcas.add(id);
                 }
                 if (info.kind != DLC) readControl(info, ncas);
             } catch (IOException e) {

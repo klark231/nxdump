@@ -12,16 +12,21 @@ import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.nxdump.core.Container
 import com.nxdump.core.Dumper
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.IOException
 import java.io.InterruptedIOException
+
+data class DlcRef(val uri: String, val name: String, val titleId: Long)
 
 data class Request(
     val appId: Long, val title: String,
     val baseUri: String, val baseName: String,
     val updateUri: String?, val updateName: String?,
     val exefs: Boolean, val romfs: Boolean,
+    val dlc: List<DlcRef> = emptyList(),
+    val jobs: Int = 1,
 )
 
 enum class Phase { IDLE, RUNNING, DONE, FAILED, CANCELLED }
@@ -80,8 +85,9 @@ class ExtractService : Service() {
         try {
             val keys = KeyStore.load(ctx) ?: throw IOException("Keys are not set up")
             val tree = Prefs(ctx).outputTree?.let { Uri.parse(it) } ?: throw IOException("Output folder is not set")
+            val tags = buildList { if (r.updateUri != null) add("update"); if (r.dlc.isNotEmpty()) add("DLC") }
             val folder = (r.title.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifEmpty { "game" }) +
-                " [%016X]".format(r.appId) + if (r.updateUri != null) " + update" else ""
+                " [%016X]".format(r.appId) + if (tags.isEmpty()) "" else " + " + tags.joinToString(" + ")
             val sink = SafSink(ctx, tree, folder)
             msg = sink.topName
             var lastUi = 0L
@@ -100,16 +106,18 @@ class ExtractService : Service() {
                 }
                 override fun cancelled() = Extractor.cancelFlag
             }
-            openContainer(ctx, Uri.parse(r.baseUri), r.baseName).use { base ->
-                val uu = r.updateUri
-                val upd = if (uu == null) null
-                else if (uu == r.baseUri) base
-                else openContainer(ctx, Uri.parse(uu), r.updateName ?: "update")
-                try {
-                    Dumper.dump(base, upd, r.appId, r.exefs, r.romfs, keys, sink, progress)
-                } finally {
-                    if (upd != null && upd !== base) upd.close()
-                }
+            // Each file is opened once, even when base / update / DLC live in the same bundle NSP.
+            val opened = HashMap<String, Container>()
+            fun openOnce(uri: String, name: String): Container =
+                opened.getOrPut(uri) { openContainer(ctx, Uri.parse(uri), name) }
+            try {
+                val needGame = r.exefs || r.romfs
+                val base = if (needGame) openOnce(r.baseUri, r.baseName) else null
+                val upd = if (needGame) r.updateUri?.let { openOnce(it, r.updateName ?: "update") } else null
+                val dlc = r.dlc.map { Dumper.Dlc(openOnce(it.uri, it.name), it.titleId) }
+                Dumper.dump(base, upd, r.appId, r.exefs, r.romfs, dlc, keys, sink, progress, r.jobs)
+            } finally {
+                opened.values.forEach { try { it.close() } catch (_: Exception) { } }
             }
         } catch (e: InterruptedIOException) {
             phase = Phase.CANCELLED; msg = "Cancelled. Partial files were left in the output folder."

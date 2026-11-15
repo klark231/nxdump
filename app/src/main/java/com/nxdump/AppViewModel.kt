@@ -28,6 +28,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var gamesName by mutableStateOf<String?>(null); private set
     var outputName by mutableStateOf<String?>(null); private set
     var extraCount by mutableIntStateOf(0); private set
+    val maxJobs = Prefs.maxJobs
+    var jobs by mutableIntStateOf(prefs.jobs); private set
 
     var games by mutableStateOf<List<Game>>(emptyList()); private set
     var problems by mutableStateOf<List<Entry>>(emptyList()); private set
@@ -51,6 +53,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         outputName = prefs.outputTree?.let { Library.treeName(ctx, it) ?: "Selected folder" }
         extraCount = prefs.extraFiles.size
     }
+
+    fun changeJobs(v: Int) { jobs = v.coerceIn(1, maxJobs); prefs.jobs = jobs }
 
     fun importKeys(uri: Uri, title: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -126,12 +130,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun extract(game: Game, exefs: Boolean, romfs: Boolean, update: Entry?) {
+    fun extract(game: Game, exefs: Boolean, romfs: Boolean, update: Entry?, dlc: List<Entry> = emptyList()) {
         Extractor.start(
             ctx,
             Request(
                 game.appId, game.base.name, game.base.uri, game.base.fileName,
                 update?.uri, update?.fileName, exefs, romfs,
+                dlc.map { DlcRef(it.uri, it.fileName, it.titleId) },
+                jobs,
             ),
         )
     }

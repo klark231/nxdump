@@ -23,7 +23,9 @@ data class Entry(
     val name: String, val displayVersion: String, val hasIcon: Boolean, val error: String?,
 )
 
-data class Game(val appId: Long, val base: Entry, val updates: List<Entry>, val dlcCount: Int)
+data class Game(val appId: Long, val base: Entry, val updates: List<Entry>, val dlc: List<Entry>) {
+    val dlcCount: Int get() = dlc.size
+}
 
 fun openContainer(ctx: Context, uri: Uri, name: String): Container {
     val pfd = ctx.contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open $name")
@@ -130,7 +132,9 @@ object Library {
             Game(
                 b.appId, b,
                 ok.filter { it.kind == Analyzer.UPDATE && it.appId == b.appId }.sortedByDescending { it.version },
-                ok.count { it.kind == Analyzer.DLC && it.appId == b.appId },
+                // one entry per DLC title; if several versions are present keep the newest
+                ok.filter { it.kind == Analyzer.DLC && it.appId == b.appId }
+                    .groupBy { it.titleId }.map { (_, v) -> v.maxBy { it.version } }.sortedBy { it.titleId },
             )
         }.sortedBy { it.base.name.lowercase() }
     }

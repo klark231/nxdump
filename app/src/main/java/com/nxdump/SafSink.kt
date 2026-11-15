@@ -12,6 +12,7 @@ import java.io.OutputStream
 class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.Sink {
     private val resolver = ctx.contentResolver
     private val dirs = HashMap<String, Uri>()
+    private val lock = Any()
     val topName: String
 
     init {
@@ -50,9 +51,12 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : Dumper.
         return u
     }
 
+    /** Called from several extraction threads: folder/file creation is serialised, the data writes are not. */
     override fun open(relativePath: String): OutputStream {
-        val d = dir(relativePath.substringBeforeLast('/', ""))
-        val f = create(d, "application/octet-stream", relativePath.substringAfterLast('/'))
+        val f = synchronized(lock) {
+            val d = dir(relativePath.substringBeforeLast('/', ""))
+            create(d, "application/octet-stream", relativePath.substringAfterLast('/'))
+        }
         val os = resolver.openOutputStream(f, "w") ?: throw IOException("Cannot write $relativePath")
         return BufferedOutputStream(os, 1 shl 20)
     }

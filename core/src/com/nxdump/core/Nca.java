@@ -81,7 +81,7 @@ public final class Nca {
         return null;
     }
 
-    private byte[] contentKey() throws IOException {
+    private synchronized byte[] contentKey() throws IOException {
         if (contentKey != null) return contentKey;
         if (hasRightsId()) {
             byte[] enc = keys.titleKey(rightsIdHex());

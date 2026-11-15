@@ -194,12 +194,34 @@ prog_u = nca_blob(0, UPD, [sec_pfs(upd_exefs), sec_bktr(base_rom, new_rom)], rig
 ctrl_u = nca_blob(2, UPD, [sec_romfs({"control.nacp": nacp("Test Game: Ünïcode", "1.1.0"), "icon_AmericanEnglish.dat": icon})], rights=rights_u, content_key=tk)
 meta_u = nca_blob(1, UPD, [sec_pfs({"Patch_%016x.cnmt" % UPD: cnmt(UPD, 65536, 0x81)})])
 
+# ---- DLC: DLC1 has a proper CNMT content list (+ hash-style NCA name); DLC2 has two data NCAs found by header only
+DLC1 = APP + 0x1001; DLC2 = APP + 0x1002
+rights_d1 = rb(15) + bytes([GEN]); rights_d2 = rb(15) + bytes([GEN])
+dlc1_rom = {"big/pack.bin": R.getrandbits(8 * 9_000_000).to_bytes(9_000_000, "little"),   # >4 MiB: exercises the read-ahead pipeline
+            "chars/hero.bin": rb(70000), "chars/readme.txt": b"dlc one", "stage/s1.dat": rb(5000)}
+dlc2_rom_a = {"a/one.bin": rb(33333), "top.txt": b"dlc two part a"}
+dlc2_rom_b = {"b/two.bin": rb(2222)}
+def cnmt_dlc(tid, version, contents):
+    b = bytearray(0x20 + 0x10 + 0x38 * len(contents)); b[0:8] = u64(tid); b[8:12] = struct.pack("<I", version); b[0xC] = 0x82
+    b[0xE:0x10] = struct.pack("<H", 0x10); b[0x10:0x12] = struct.pack("<H", len(contents)); b[0x20:0x28] = u64(APP)
+    for k, (cid, ct) in enumerate(contents):
+        o = 0x30 + 0x38 * k; b[o + 0x20:o + 0x30] = cid; b[o + 0x36] = ct
+    return bytes(b)
+cid_d1 = rb(16)
+data_d1 = nca_blob(4, DLC1, [sec_romfs(dlc1_rom)], rights=rights_d1, content_key=tk)
+meta_d1 = nca_blob(1, DLC1, [sec_pfs({"AddOnContent_%016x.cnmt" % DLC1: cnmt_dlc(DLC1, 65536, [(cid_d1, 2)])})])
+data_d2a = nca_blob(4, DLC2, [sec_romfs(dlc2_rom_a)], rights=rights_d2, content_key=tk)
+data_d2b = nca_blob(4, DLC2, [sec_romfs(dlc2_rom_b)], rights=rights_d2, content_key=tk)
+meta_d2 = nca_blob(1, DLC2, [sec_pfs({"AddOnContent_%016x.cnmt" % DLC2: cnmt_dlc(DLC2, 0, [])})])
+
 out = sys.argv[1]; os.makedirs(out, exist_ok=True)
 open(out + "/prod.keys", "w").write(
     "; test keys\nheader_key = %s\nkey_area_key_application_%02x = %s\ntitlekek_%02x = %s\nmaster_key_%02x = %s\n"
     % (HEADER_KEY.hex(), GEN, KAK.hex(), GEN, TITLEKEK.hex(), GEN, rb(16).hex()))
 open(out + "/base.nsp", "wb").write(pfs0({"p.nca": prog_b, "c.nca": ctrl_b, "m.cnmt.nca": meta_b, "r.tik": tik(rights, enc_tk)}))
 open(out + "/update.nsp", "wb").write(pfs0({"p.nca": prog_u, "c.nca": ctrl_u, "m.cnmt.nca": meta_u, "r.tik": tik(rights_u, enc_tk)}))
+open(out + "/dlc.nsp", "wb").write(pfs0({cid_d1.hex() + ".nca": data_d1, "d1.cnmt.nca": meta_d1, "d1.tik": tik(rights_d1, enc_tk),
+                                         "d2a.nca": data_d2a, "d2b.nca": data_d2b, "d2.cnmt.nca": meta_d2, "d2.tik": tik(rights_d2, enc_tk)}))
 # XCI: pad header, HFS0 root at 0xF000
 sec = hfs0({"p.nca": prog_b, "c.nca": ctrl_b, "m.cnmt.nca": meta_b, "r.tik": tik(rights, enc_tk)})
 root = hfs0({"update": hfs0({}), "secure": sec})
@@ -211,4 +233,6 @@ def dump_expected(d, files):
         fp = os.path.join(out, d, p); os.makedirs(os.path.dirname(fp), exist_ok=True); open(fp, "wb").write(b)
 dump_expected("exp_base/exefs", base_exefs); dump_expected("exp_base/romfs", base_rom)
 dump_expected("exp_merged/exefs", upd_exefs); dump_expected("exp_merged/romfs", new_rom)
+dump_expected("exp_dlc/dlc/%016X/romfs" % DLC1, dlc1_rom)
+dump_expected("exp_dlc/dlc/%016X/romfs" % DLC2, dlc2_rom_a); dump_expected("exp_dlc/dlc/%016X/romfs_2" % DLC2, dlc2_rom_b)
 print("generated", os.listdir(out))
