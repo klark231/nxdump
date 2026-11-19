@@ -76,18 +76,37 @@ public final class Container implements Closeable {
         }
     }
 
-    /** Opens every NCA; ones that fail are reported in errors (may be null). */
-    public List<Nca> openNcas(Keys keys, List<String> errors) {
-        List<Nca> out = new ArrayList<>();
-        for (Item it : items) {
-            if (!it.name.toLowerCase().endsWith(".nca")) continue;
-            try {
-                out.add(new Nca(itemSource(it), keys, it.name));
-            } catch (IOException e) {
-                if (errors != null) errors.add(e.getMessage());
-            }
+    private List<Nca> ncaCache;
+    private List<String> ncaErrors;
+
+    /**
+     * Opens every NCA once (header read + decrypt) and memoizes the result; ones that fail are reported in
+     * errors (may be null). Safe to share: an Nca only needs the header key at construction, titlekeys are
+     * looked up lazily.
+     */
+    public synchronized List<Nca> openNcas(Keys keys, List<String> errors) {
+        if (ncaCache == null) {
+            List<Item> todo = new ArrayList<>();
+            for (Item it : items) if (it.name.toLowerCase().endsWith(".nca")) todo.add(it);
+            Nca[] res = new Nca[todo.size()];
+            String[] err = new String[todo.size()];
+            // Each NCA costs a header read (an IPC round trip on SAF) plus a decrypt: do them side by side.
+            java.util.stream.IntStream range = java.util.stream.IntStream.range(0, res.length);
+            (res.length > 1 ? range.parallel() : range).forEach(i -> {
+                Item it = todo.get(i);
+                try {
+                    res[i] = new Nca(itemSource(it), keys, it.name);
+                } catch (IOException e) {
+                    err[i] = e.getMessage();
+                }
+            });
+            List<Nca> out = new ArrayList<>();
+            List<String> errs = new ArrayList<>();
+            for (int i = 0; i < res.length; i++) { if (res[i] != null) out.add(res[i]); else errs.add(err[i]); }
+            ncaCache = out; ncaErrors = errs;
         }
-        return out;
+        if (errors != null) errors.addAll(ncaErrors);
+        return new ArrayList<>(ncaCache);
     }
 
     @Override public void close() throws IOException { if (closer != null) closer.close(); }

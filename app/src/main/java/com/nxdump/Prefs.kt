@@ -17,6 +17,11 @@ class Prefs(ctx: Context) {
         get() = sp.getInt("jobs", defaultJobs).coerceIn(1, maxJobs)
         set(v) = sp.edit().putInt("jobs", v.coerceIn(1, maxJobs)).apply()
 
+    /** Use plain file access instead of SAF when "All files access" is granted and the output folder allows it. */
+    var directAccess: Boolean
+        get() = sp.getBoolean("direct", true)
+        set(v) = sp.edit().putBoolean("direct", v).apply()
+
     var setupDone: Boolean
         get() = sp.getBoolean("setup", false)
         set(v) = sp.edit().putBoolean("setup", v).apply()

@@ -34,7 +34,27 @@ enum class Phase { IDLE, RUNNING, DONE, FAILED, CANCELLED }
 data class ExtractState(
     val phase: Phase = Phase.IDLE, val title: String = "", val file: String = "",
     val done: Long = 0, val total: Long = 0, val message: String? = null,
+    /** Setup phase name ("Reading game data", "Creating folders"); empty once files are being copied. */
+    val stage: String = "Starting\u2026", val stageDone: Long = 0, val stageTotal: Long = 0,
+    val filesDone: Long = 0, val filesTotal: Long = 0,
+    val bytesPerSec: Double = 0.0, val filesPerSec: Double = 0.0, val etaSec: Long = -1,
 )
+
+/** Exponentially smoothed throughput over ~1 s samples. */
+class RateMeter {
+    private var t0 = 0L; private var b0 = 0L; private var f0 = 0L
+    var bytesPerSec = 0.0; private set
+    var filesPerSec = 0.0; private set
+    fun reset(now: Long, bytes: Long, files: Long) { t0 = now; b0 = bytes; f0 = files; bytesPerSec = 0.0; filesPerSec = 0.0 }
+    fun sample(now: Long, bytes: Long, files: Long) {
+        val dt = (now - t0) / 1000.0
+        if (dt < 1.0) return
+        val br = (bytes - b0) / dt; val fr = (files - f0) / dt
+        bytesPerSec = if (bytesPerSec == 0.0) br else bytesPerSec * 0.6 + br * 0.4
+        filesPerSec = if (filesPerSec == 0.0) fr else filesPerSec * 0.6 + fr * 0.4
+        t0 = now; b0 = bytes; f0 = files
+    }
+}
 
 object Extractor {
     val state = MutableStateFlow(ExtractState())
@@ -78,6 +98,40 @@ class ExtractService : Service() {
             .apply { if (ongoing) setProgress(100, pct, indeterminate) }
             .build()
 
+    /** Samples throughput every 5 s and dumps worker stacks when progress stalls; output: Android/data/com.nxdump/files/nxdump-diag.txt */
+    private fun startDiag(ctx: Context, mode: String): Thread {
+        val file = java.io.File(ctx.getExternalFilesDir(null), "nxdump-diag.txt")
+        file.writeText("diag start ${java.util.Date()} output=$mode\n")
+        val t = Thread {
+            var last = 0L; var lastMoved = SystemClock.elapsedRealtime(); var lastDump = 0L
+            val t0 = lastMoved
+            try {
+                while (true) {
+                    Thread.sleep(5000)
+                    val now = SystemClock.elapsedRealtime()
+                    val st = Extractor.state.value
+                    val rate = (st.done - last) / 5.0 / 1048576
+                    if (st.done != last) lastMoved = now
+                    last = st.done
+                    val sb = StringBuilder("t=${(now - t0) / 1000}s done=${st.done / 1048576}MB/${st.total / 1048576}MB rate=" + "%.1f".format(rate) + "MB/s file=${st.file} stage='${st.stage}' ${st.stageDone}/${st.stageTotal} files=${st.filesDone}/${st.filesTotal} saf[${SafStats.summary()}]\n")
+                    if (rate < 20 && now - lastDump > 20000) {
+                        lastDump = now
+                        sb.append("--- thread dump ---\n")
+                        for ((th, stack) in Thread.getAllStackTraces())
+                            if (th.name.startsWith("nxdump-") || th.name == "Thread-2" || th.name.startsWith("Thread-")) {
+                                sb.append("[${th.name}] ${th.state}\n")
+                                stack.take(14).forEach { sb.append("    at $it\n") }
+                            }
+                    }
+                    file.appendText(sb.toString())
+                    android.util.Log.i("NxDiag", sb.toString())
+                }
+            } catch (_: InterruptedException) { }
+        }
+        t.isDaemon = true; t.start()
+        return t
+    }
+
     private fun run(r: Request, nm: NotificationManager) {
         val ctx = applicationContext
         var phase = Phase.DONE
@@ -88,24 +142,57 @@ class ExtractService : Service() {
             val tags = buildList { if (r.updateUri != null) add("update"); if (r.dlc.isNotEmpty()) add("DLC") }
             val folder = (r.title.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifEmpty { "game" }) +
                 " [%016X]".format(r.appId) + if (tags.isEmpty()) "" else " + " + tags.joinToString(" + ")
-            val sink = SafSink(ctx, tree, folder)
+            val direct = if (Prefs(ctx).directAccess && DirectAccess.granted()) DirectAccess.resolve(tree) else null
+            val sink: NamedSink = if (direct != null) FileSink(direct, folder) else SafSink(ctx, tree, folder)
+            val mode = if (direct != null) "direct files (${direct.path})" else "SAF"
+            android.util.Log.i("NxDump", "output via $mode")
             msg = sink.topName
             var lastUi = 0L
             var lastNotif = 0L
+            val meter = RateMeter()
             val progress = object : Dumper.Progress {
-                override fun update(file: String, done: Long, total: Long) {
+                // The core serialises update()/files(); stage() is called from the single setup thread.
+                private val lock = Any()
+                private var curFiles = 0L
+                private var curBytes = 0L
+
+                private fun push(force: Boolean, f: (ExtractState) -> ExtractState) = synchronized(lock) {
                     val now = SystemClock.elapsedRealtime()
-                    if (done < total && now - lastUi < 150) return
+                    if (!force && now - lastUi < 150) return@synchronized
                     lastUi = now
-                    Extractor.state.value = Extractor.state.value.copy(file = file, done = done, total = total)
+                    meter.sample(now, curBytes, curFiles)
+                    val st = f(Extractor.state.value)
+                    // ETA from files left / files per second (byte-based ETAs swing wildly with file size mix).
+                    val eta = if (meter.filesPerSec > 0.05 && st.filesTotal > 0) ((st.filesTotal - st.filesDone) / meter.filesPerSec).toLong() else -1L
+                    Extractor.state.value = st.copy(bytesPerSec = meter.bytesPerSec, filesPerSec = meter.filesPerSec, etaSec = eta)
                     if (now - lastNotif > 1000) {
                         lastNotif = now
-                        val pct = if (total > 0) (done * 100 / total).toInt() else 0
-                        nm.notify(1, notification(r.title, "$pct%  \u00B7  $file", pct, false))
+                        if (st.stage.isNotEmpty()) {
+                            val pct = if (st.stageTotal > 0) (st.stageDone * 100 / st.stageTotal).toInt() else 0
+                            val what = if (st.stageTotal > 0) "${st.stage} ${st.stageDone}/${st.stageTotal}" else st.stage
+                            nm.notify(1, notification(r.title, what, pct, st.stageTotal <= 0))
+                        } else {
+                            val pct = if (st.total > 0) (st.done * 100 / st.total).toInt() else 0
+                            nm.notify(1, notification(r.title, "$pct%  \u00B7  ${st.filesDone}/${st.filesTotal} files  \u00B7  " + "%.1f".format(meter.filesPerSec) + " files/s", pct, false))
+                        }
                     }
+                }
+
+                override fun stage(name: String, done: Long, total: Long) {
+                    if (name.isEmpty()) synchronized(lock) { meter.reset(SystemClock.elapsedRealtime(), 0, 0); curBytes = 0; curFiles = 0 }
+                    push(done >= total || name.isEmpty()) { it.copy(stage = name, stageDone = done, stageTotal = total) }
+                }
+                override fun files(done: Long, total: Long) {
+                    curFiles = done
+                    push(done >= total) { it.copy(filesDone = done, filesTotal = total) }
+                }
+                override fun update(file: String, done: Long, total: Long) {
+                    curBytes = done
+                    push(done >= total) { it.copy(file = file, done = done, total = total) }
                 }
                 override fun cancelled() = Extractor.cancelFlag
             }
+            val diag = startDiag(ctx, mode)
             // Each file is opened once, even when base / update / DLC live in the same bundle NSP.
             val opened = HashMap<String, Container>()
             fun openOnce(uri: String, name: String): Container =
@@ -117,12 +204,19 @@ class ExtractService : Service() {
                 val dlc = r.dlc.map { Dumper.Dlc(openOnce(it.uri, it.name), it.titleId) }
                 Dumper.dump(base, upd, r.appId, r.exefs, r.romfs, dlc, keys, sink, progress, r.jobs)
             } finally {
+                diag.interrupt()
                 opened.values.forEach { try { it.close() } catch (_: Exception) { } }
             }
         } catch (e: InterruptedIOException) {
             phase = Phase.CANCELLED; msg = "Cancelled. Partial files were left in the output folder."
         } catch (e: Throwable) {
-            phase = Phase.FAILED; msg = e.message ?: e.toString()
+            phase = Phase.FAILED
+            // Core errors already read well; anything else gets its class so odd provider messages are traceable.
+            msg = if (e is com.nxdump.core.NxException) (e.message ?: e.toString())
+                  else "${e.javaClass.simpleName}: ${e.message ?: "(no message)"}"
+            val trace = android.util.Log.getStackTraceString(e)
+            android.util.Log.e("NxDump", "extraction failed", e)
+            try { java.io.File(ctx.getExternalFilesDir(null), "nxdump-diag.txt").appendText("\nFAILED: $msg\n$trace\n") } catch (_: Exception) { }
         }
         Extractor.state.value = Extractor.state.value.copy(phase = phase, message = msg)
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)

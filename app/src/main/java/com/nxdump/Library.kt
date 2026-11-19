@@ -94,19 +94,42 @@ object Library {
         null
     }
 
+    private const val SCAN_THREADS = 4
+    private val iconLock = Any()
+
     fun scan(
         ctx: Context, files: List<LibFile>, keys: Keys, cache: List<Entry>,
         cancelled: () -> Boolean, progress: (Int, Int) -> Unit,
     ): List<Entry> {
         val byUri = cache.groupBy { it.uri }
-        val out = ArrayList<Entry>()
+        val results = arrayOfNulls<List<Entry>>(files.size)
+        val todo = ArrayList<Int>()
         files.forEachIndexed { i, f ->
-            if (cancelled()) return out
-            progress(i, files.size)
             val hit = byUri[f.uri]?.takeIf { l -> l.isNotEmpty() && l.all { it.size == f.size && it.modified == f.modified } }
-            if (hit != null) out.addAll(hit) else out.addAll(analyze(ctx, f, keys))
+            if (hit != null) results[i] = hit else todo.add(i)
         }
-        progress(files.size, files.size)
+        var done = files.size - todo.size
+        progress(done, files.size)
+        if (todo.isNotEmpty()) {
+            // Uncached files are opened and parsed several at a time: each one is mostly waiting on SAF reads.
+            val next = java.util.concurrent.atomic.AtomicInteger()
+            val lock = Any()
+            val worker = Runnable {
+                while (true) {
+                    if (cancelled()) return@Runnable
+                    val k = next.getAndIncrement()
+                    if (k >= todo.size) return@Runnable
+                    val i = todo[k]
+                    results[i] = analyze(ctx, files[i], keys)
+                    synchronized(lock) { done++; progress(done, files.size) }
+                }
+            }
+            val threads = (0 until minOf(SCAN_THREADS, todo.size)).map { Thread(worker, "nxdump-scan-$it").apply { isDaemon = true; start() } }
+            threads.forEach { it.join() }
+        }
+        val out = ArrayList<Entry>()
+        results.forEach { if (it != null) out.addAll(it) }
+        if (!cancelled()) progress(files.size, files.size)
         return out
     }
 
@@ -114,7 +137,7 @@ object Library {
         openContainer(ctx, Uri.parse(f.uri), f.name).use { c ->
             Analyzer.analyze(c, keys).map { i ->
                 val icon: ByteArray? = i.icon
-                if (icon != null) try { iconFile(ctx, i.titleId).writeBytes(icon) } catch (e: Exception) { }
+                if (icon != null) try { synchronized(iconLock) { iconFile(ctx, i.titleId).writeBytes(icon) } } catch (e: Exception) { }
                 val kind = if (i.error != null && i.titleId == 0L) -1 else i.kind
                 Entry(
                     f.uri, f.name, f.size, f.modified, kind, i.titleId, i.appId, i.version,
