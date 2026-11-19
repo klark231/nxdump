@@ -36,6 +36,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
@@ -160,6 +161,19 @@ fun NxApp(vm: AppViewModel) {
                 SettingsScreen(vm, pickers, snack)
             }
         }
+        if (vm.showDirectPrompt && vm.setupDone) AlertDialog(
+            onDismissRequest = { vm.dismissDirectPrompt() },
+            icon = { Icon(Icons.Default.Bolt, null) },
+            title = { Text("Extract much faster") },
+            text = {
+                Text(
+                    "NxDump can now write straight to your storage instead of going through Android\u2019s document provider, " +
+                        "which slows down badly on games with many files. It needs \u201CAll files access\u201D, granted once in Settings."
+                )
+            },
+            confirmButton = { TextButton(onClick = { vm.dismissDirectPrompt(); DirectAccess.openSettings(ctx) }) { Text("Open settings") } },
+            dismissButton = { TextButton(onClick = { vm.dismissDirectPrompt() }) { Text("Not now") } },
+        )
         ExtractDialog()
     }
 }
@@ -228,8 +242,10 @@ fun StepPage(icon: ImageVector, title: String, body: String, content: @Composabl
 
 @Composable
 fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
+    val ctx = LocalContext.current
     var step by remember { mutableIntStateOf(0) }
     val canNext = when (step) { 1 -> vm.keysSummary != null; 3 -> vm.outputName != null; else -> true }
+    val last = 4
     Scaffold(
         containerColor = Color.Transparent,
         snackbarHost = { SnackbarHost(snack) },
@@ -239,14 +255,14 @@ fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
                 horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (step > 0) TextButton(onClick = { step-- }) { Text("Back") } else Spacer(Modifier.size(1.dp))
-                Button(onClick = { if (step < 3) step++ else vm.finishSetup() }, enabled = canNext) {
-                    Text(if (step == 0) "Get started" else if (step < 3) "Next" else "Finish")
+                Button(onClick = { if (step < last) step++ else vm.finishSetup() }, enabled = canNext) {
+                    Text(if (step == 0) "Get started" else if (step < last) "Next" else "Finish")
                 }
             }
         },
     ) { pad ->
         Column(Modifier.padding(pad).padding(horizontal = 24.dp).verticalScroll(rememberScrollState())) {
-            LinearProgressIndicator(progress = { (step + 1) / 4f }, Modifier.fillMaxWidth().padding(top = 16.dp))
+            LinearProgressIndicator(progress = { (step + 1) / (last + 1f) }, Modifier.fillMaxWidth().padding(top = 16.dp))
             AnimatedContent(step, label = "step") { s ->
                 when (s) {
                     0 -> StepPage(
@@ -272,6 +288,19 @@ fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
                             "You can skip this and add files one by one later.",
                     ) {
                         PickerCard("Game folder", "Optional", vm.gamesName, if (vm.gamesName == null) "Select" else "Change", pickers.gamesFolder)
+                    }
+                    4 -> StepPage(
+                        Icons.Default.Bolt, "Fast file access",
+                        if (Build.VERSION.SDK_INT < 30) "Your Android version writes files directly already \u2014 nothing to do here."
+                        else "Games with thousands of files can take hours through Android\u2019s document provider, and get slower the more it writes. " +
+                            "Allowing \u201CAll files access\u201D lets NxDump write plain files instead, which is far faster. " +
+                            "It\u2019s used only for your output folder, and you can change it later in Settings.",
+                    ) {
+                        if (Build.VERSION.SDK_INT >= 30) {
+                            if (vm.directGranted) Text("\u2713 All files access allowed", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleMedium)
+                            else Button(onClick = { DirectAccess.openSettings(ctx) }, Modifier.fillMaxWidth()) { Text("Allow all files access") }
+                            if (!vm.directGranted) Text("You can skip this; extraction will then use the slower method.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                     else -> StepPage(
                         Icons.Default.FolderOpen, "Output folder",

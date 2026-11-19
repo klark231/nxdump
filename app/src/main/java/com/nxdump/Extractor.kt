@@ -116,6 +116,7 @@ class ExtractService : Service() {
                     if (st.done != last) lastMoved = now
                     last = st.done
                     val sb = StringBuilder("t=${(now - t0) / 1000}s done=${st.done / 1048576}MB/${st.total / 1048576}MB rate=" + "%.1f".format(rate) + "MB/s file=${st.file} stage='${st.stage}' ${st.stageDone}/${st.stageTotal} files=${st.filesDone}/${st.filesTotal} saf[${SafStats.summary()}]\n")
+                    if (rate < 20) SafStats.dirReport().let { if (it.isNotEmpty()) sb.append(it) }
                     if (rate < 20 && now - lastDump > 20000) {
                         lastDump = now
                         sb.append("--- thread dump ---\n")

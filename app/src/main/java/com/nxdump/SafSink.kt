@@ -17,9 +17,32 @@ object SafStats {
     private val count = java.util.concurrent.atomic.AtomicLong()
     private val totalMs = java.util.concurrent.atomic.AtomicLong()
     private val maxMs = java.util.concurrent.atomic.AtomicLong()
-    fun reset() { count.set(0); totalMs.set(0); maxMs.set(0) }
-    fun record(ms: Long) { count.incrementAndGet(); totalMs.addAndGet(ms); maxMs.accumulateAndGet(ms) { a, b -> maxOf(a, b) } }
-    fun summary(): String { val n = count.get(); return "creates=$n avg=${if (n > 0) totalMs.get() / n else 0}ms max=${maxMs.get()}ms" }
+    private val winCount = java.util.concurrent.atomic.AtomicLong()
+    private val winMs = java.util.concurrent.atomic.AtomicLong()
+
+    /** Per parent folder: creates so far plus the mean latency of each block of [BLOCK] creates (sibling-count theory). */
+    private class PerDir { var n = 0L; var blockMs = 0L; val blocks = ArrayList<Long>() }
+    private const val BLOCK = 2000
+    private val perDir = HashMap<String, PerDir>()
+
+    fun reset() { count.set(0); totalMs.set(0); maxMs.set(0); winCount.set(0); winMs.set(0); synchronized(perDir) { perDir.clear() } }
+    fun record(dir: String, ms: Long) {
+        count.incrementAndGet(); totalMs.addAndGet(ms); maxMs.accumulateAndGet(ms) { a, b -> maxOf(a, b) }
+        winCount.incrementAndGet(); winMs.addAndGet(ms)
+        synchronized(perDir) {
+            val d = perDir.getOrPut(dir) { PerDir() }
+            d.n++; d.blockMs += ms
+            if (d.n % BLOCK == 0L) { d.blocks.add(d.blockMs / BLOCK); d.blockMs = 0 }
+        }
+    }
+    /** Mean latency since the previous call: the cumulative average hides a late slowdown. */
+    fun window(): String { val n = winCount.getAndSet(0); val ms = winMs.getAndSet(0); return "win=${if (n > 0) ms / n else 0}ms/$n" }
+    /** Folders with >= BLOCK creates: "path n=.. ms/2000-block=[a,b,..]". Rising numbers = create cost grows with siblings. */
+    fun dirReport(): String = synchronized(perDir) {
+        perDir.filter { it.value.blocks.isNotEmpty() }.entries.sortedByDescending { it.value.n }.take(4)
+            .joinToString("") { (k, v) -> "  dir '$k' creates=${v.n} avgMsPer${BLOCK}=${v.blocks}\n" }
+    }
+    fun summary(): String { val n = count.get(); return "creates=$n avg=${if (n > 0) totalMs.get() / n else 0}ms max=${maxMs.get()}ms ${window()}" }
 }
 
 class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSink {
@@ -37,7 +60,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
         var n = 2
         while (findChild(root, name) != null) name = "$wantedName ($n)".also { n++ }
         topName = name
-        dirs[""] = create(root, DocumentsContract.Document.MIME_TYPE_DIR, name)
+        dirs[""] = create(root, DocumentsContract.Document.MIME_TYPE_DIR, name, "<root>")
     }
 
     private fun findChild(parent: Uri, name: String): Uri? {
@@ -54,13 +77,13 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
         return null
     }
 
-    private fun create(parent: Uri, mime: String, name: String): Uri {
+    private fun create(parent: Uri, mime: String, name: String, dirKey: String): Uri {
         val t0 = SystemClock.elapsedRealtime()
         try {
             return DocumentsContract.createDocument(resolver, parent, mime, name)
                 ?: throw IOException("Cannot create \"$name\" in the output folder")
         } finally {
-            SafStats.record(SystemClock.elapsedRealtime() - t0)
+            SafStats.record(dirKey, SystemClock.elapsedRealtime() - t0)
         }
     }
 
@@ -70,7 +93,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
         val name = path.substringAfterLast('/')
         // Everything below the fresh top folder is ours, so a subfolder can't already exist: skip the
         // O(siblings) directory listing that findChild() would do for every new folder.
-        val u = create(parent, DocumentsContract.Document.MIME_TYPE_DIR, name)
+        val u = create(parent, DocumentsContract.Document.MIME_TYPE_DIR, name, path.substringBeforeLast('/', ""))
         dirs[path] = u
         return u
     }
@@ -100,7 +123,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
                     pool.submit {
                         if (prog.cancelled()) throw java.io.InterruptedIOException("Cancelled")
                         val parent = synchronized(lock) { dirs[d.substringBeforeLast('/', "")] } ?: throw IOException("Missing parent of $d")
-                        val u = create(parent, DocumentsContract.Document.MIME_TYPE_DIR, d.substringAfterLast('/'))
+                        val u = create(parent, DocumentsContract.Document.MIME_TYPE_DIR, d.substringAfterLast('/'), d.substringBeforeLast('/', ""))
                         synchronized(lock) { dirs[d] = u }
                         synchronized(doneLock) { if (open) { done++; prog.stage("Creating folders", done, total) } }
                     }
@@ -121,14 +144,14 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
     /** Empty files need no output stream: creating the document is enough (saves one IPC each). */
     override fun createEmpty(relativePath: String) {
         val d = synchronized(lock) { dir(relativePath.substringBeforeLast('/', "")) }
-        create(d, "application/octet-stream", relativePath.substringAfterLast('/'))
+        create(d, "application/octet-stream", relativePath.substringAfterLast('/'), relativePath.substringBeforeLast('/', ""))
     }
 
     /** Called from several extraction threads: folder/file creation is serialised, the data writes are not. */
     override fun open(relativePath: String): OutputStream {
         val d = synchronized(lock) { dir(relativePath.substringBeforeLast('/', "")) }
         val t0 = SystemClock.elapsedRealtime()
-        val f = create(d, "application/octet-stream", relativePath.substringAfterLast('/'))
+        val f = create(d, "application/octet-stream", relativePath.substringAfterLast('/'), relativePath.substringBeforeLast('/', ""))
         val t1 = SystemClock.elapsedRealtime()
         val os = resolver.openOutputStream(f, "w") ?: throw IOException("Cannot write $relativePath")
         val t2 = SystemClock.elapsedRealtime()

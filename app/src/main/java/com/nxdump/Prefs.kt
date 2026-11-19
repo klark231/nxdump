@@ -26,6 +26,11 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("setup", false)
         set(v) = sp.edit().putBoolean("setup", v).apply()
 
+    /** The "turn on fast file access" prompt has been shown (setup page or update dialog), so don't nag again. */
+    var directPromptSeen: Boolean
+        get() = sp.getBoolean("direct_prompt", false)
+        set(v) = sp.edit().putBoolean("direct_prompt", v).apply()
+
     var gamesTree: String?
         get() = sp.getString("games", null)
         set(v) = sp.edit().putString("games", v).apply()

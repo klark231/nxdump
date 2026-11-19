@@ -26,6 +26,12 @@ object DirectAccess {
     fun requestIntent(ctx: Context): Intent =
         Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${ctx.packageName}"))
 
+    /** Opens the "All files access" settings page for this app (falls back to the generic list on odd ROMs). */
+    fun openSettings(ctx: Context) {
+        try { ctx.startActivity(requestIntent(ctx)) }
+        catch (e: Exception) { try { ctx.startActivity(fallbackIntent()) } catch (_: Exception) { } }
+    }
+
     fun fallbackIntent(): Intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
 
     /** The real directory behind an external-storage SAF tree (internal storage, SD card, USB), or null. */
