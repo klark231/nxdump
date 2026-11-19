@@ -146,8 +146,11 @@ public final class Dumper {
     /**
      * Extracts any mix of ExeFS / RomFS (base, optionally patched by update) and DLC titles.
      * base may be null when only DLC is requested (exefs and romfs both false).
-     * <p>threads = number of files copied in parallel (1 = sequential). With jobs &gt; 1 big files also get a
-     * read-ahead pipeline (decrypt on one thread while the previous chunk is being written on another).
+     * <p>threads = number of big files copied in parallel (1 = fully sequential). With threads &gt; 1 big files also
+     * get a read-ahead pipeline (decrypt on one thread while the previous chunk is being written on another), and
+     * files under 256 KiB are handled by a separate lane of max(8, 3 &times; threads) workers (at most 16) running
+     * alongside, because their cost is per-file latency (create/open), not bytes. So the total number of files in
+     * flight can exceed {@code threads}.
      * Sink.open() may be called from several threads at once and must be thread-safe when threads &gt; 1.
      */
     public static void dump(Container base, Container update, long appId, boolean exefs, boolean romfs,
@@ -342,8 +345,9 @@ public final class Dumper {
         }
 
         void fileDone() {
-            int n = filesDone.incrementAndGet();
-            synchronized (progLock) { prog.files(n, filesTotal); }
+            synchronized (progLock) {                      // count and publish in the same order: callbacks never go backwards
+                prog.files(filesDone.incrementAndGet(), filesTotal);
+            }
         }
 
         void fail(Throwable t) { failure.compareAndSet(null, t); stop = true; }

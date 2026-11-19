@@ -9,7 +9,9 @@ import android.provider.DocumentsContract
 import android.provider.Settings
 import com.nxdump.core.Dumper
 import java.io.File
-import java.io.FileOutputStream
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.Files
+import java.nio.file.StandardOpenOption
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.io.OutputStream
@@ -83,15 +85,25 @@ class FileSink(root: File, wantedName: String) : NamedSink {
         return p
     }
 
+    /**
+     * The top folder is fresh, so any existing file is a name clash (e.g. "A.bin" and "a.bin" on a case-insensitive
+     * volume such as exFAT). Fail loudly instead of silently truncating the earlier file.
+     */
+    private fun createNew(f: File, rel: String): OutputStream = try {
+        Files.newOutputStream(f.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+    } catch (e: FileAlreadyExistsException) {
+        throw IOException("\"$rel\" already exists in the output (names that differ only by case clash on this storage)")
+    }
+
     override fun createEmpty(relativePath: String) {
         val f = target(relativePath)
         parentOf(f, relativePath)
-        FileOutputStream(f).close()
+        createNew(f, relativePath).close()
     }
 
     override fun open(relativePath: String): OutputStream {
         val f = target(relativePath)
         parentOf(f, relativePath)
-        return FileOutputStream(f)
+        return createNew(f, relativePath)
     }
 }

@@ -101,8 +101,10 @@ class ExtractService : Service() {
     /** Samples throughput every 5 s and dumps worker stacks when progress stalls; output: Android/data/com.nxdump/files/nxdump-diag.txt */
     private fun startDiag(ctx: Context, mode: String): Thread {
         val file = java.io.File(ctx.getExternalFilesDir(null), "nxdump-diag.txt")
-        file.writeText("diag start ${java.util.Date()} output=$mode\n")
+        // Diagnostics are best-effort: a full disk or missing dir must never fail or crash an extraction.
+        val enabled = try { file.writeText("diag start ${java.util.Date()} output=$mode\n"); true } catch (_: Exception) { false }
         val t = Thread {
+            if (!enabled) return@Thread
             var last = 0L; var lastMoved = SystemClock.elapsedRealtime(); var lastDump = 0L
             val t0 = lastMoved
             try {
@@ -126,7 +128,10 @@ class ExtractService : Service() {
                     file.appendText(sb.toString())
                     android.util.Log.i("NxDiag", sb.toString())
                 }
-            } catch (_: InterruptedException) { }
+            } catch (_: InterruptedException) {
+            } catch (e: Exception) {
+                android.util.Log.w("NxDiag", "diagnostics disabled: $e")
+            }
         }
         t.isDaemon = true; t.start()
         return t
@@ -151,44 +156,51 @@ class ExtractService : Service() {
             var lastNotif = 0L
             val meter = RateMeter()
             val progress = object : Dumper.Progress {
-                // The core serialises update()/files(); stage() is called from the single setup thread.
                 private val lock = Any()
-                private var curFiles = 0L
-                private var curBytes = 0L
+                // Latest values from every callback, kept even when the publication throttle skips a push, so each
+                // published snapshot is complete (a throttled file-total used to be lost, leaving the ETA blank).
+                private var sStage = "Starting\u2026"; private var sStageDone = 0L; private var sStageTotal = 0L
+                private var sFilesDone = 0L; private var sFilesTotal = 0L
+                private var sFile = ""; private var sDone = 0L; private var sTotal = 0L
 
-                private fun push(force: Boolean, f: (ExtractState) -> ExtractState) = synchronized(lock) {
+                private fun push(force: Boolean) {
                     val now = SystemClock.elapsedRealtime()
-                    if (!force && now - lastUi < 150) return@synchronized
+                    if (!force && now - lastUi < 150) return
                     lastUi = now
-                    meter.sample(now, curBytes, curFiles)
-                    val st = f(Extractor.state.value)
+                    meter.sample(now, sDone, sFilesDone)
                     // ETA from files left / files per second (byte-based ETAs swing wildly with file size mix).
-                    val eta = if (meter.filesPerSec > 0.05 && st.filesTotal > 0) ((st.filesTotal - st.filesDone) / meter.filesPerSec).toLong() else -1L
-                    Extractor.state.value = st.copy(bytesPerSec = meter.bytesPerSec, filesPerSec = meter.filesPerSec, etaSec = eta)
+                    val eta = if (meter.filesPerSec > 0.05 && sFilesTotal > 0) ((sFilesTotal - sFilesDone) / meter.filesPerSec).toLong() else -1L
+                    Extractor.state.value = Extractor.state.value.copy(
+                        file = sFile, done = sDone, total = sTotal,
+                        stage = sStage, stageDone = sStageDone, stageTotal = sStageTotal,
+                        filesDone = sFilesDone, filesTotal = sFilesTotal,
+                        bytesPerSec = meter.bytesPerSec, filesPerSec = meter.filesPerSec, etaSec = eta,
+                    )
                     if (now - lastNotif > 1000) {
                         lastNotif = now
-                        if (st.stage.isNotEmpty()) {
-                            val pct = if (st.stageTotal > 0) (st.stageDone * 100 / st.stageTotal).toInt() else 0
-                            val what = if (st.stageTotal > 0) "${st.stage} ${st.stageDone}/${st.stageTotal}" else st.stage
-                            nm.notify(1, notification(r.title, what, pct, st.stageTotal <= 0))
+                        if (sStage.isNotEmpty()) {
+                            val pct = if (sStageTotal > 0) (sStageDone * 100 / sStageTotal).toInt() else 0
+                            val what = if (sStageTotal > 0) "$sStage $sStageDone/$sStageTotal" else sStage
+                            nm.notify(1, notification(r.title, what, pct, sStageTotal <= 0))
                         } else {
-                            val pct = if (st.total > 0) (st.done * 100 / st.total).toInt() else 0
-                            nm.notify(1, notification(r.title, "$pct%  \u00B7  ${st.filesDone}/${st.filesTotal} files  \u00B7  " + "%.1f".format(meter.filesPerSec) + " files/s", pct, false))
+                            val pct = if (sTotal > 0) (sDone * 100 / sTotal).toInt() else 0
+                            nm.notify(1, notification(r.title, "$pct%  \u00B7  $sFilesDone/$sFilesTotal files  \u00B7  " + "%.1f".format(meter.filesPerSec) + " files/s", pct, false))
                         }
                     }
                 }
 
-                override fun stage(name: String, done: Long, total: Long) {
-                    if (name.isEmpty()) synchronized(lock) { meter.reset(SystemClock.elapsedRealtime(), 0, 0); curBytes = 0; curFiles = 0 }
-                    push(done >= total || name.isEmpty()) { it.copy(stage = name, stageDone = done, stageTotal = total) }
+                override fun stage(name: String, done: Long, total: Long) = synchronized(lock) {
+                    sStage = name; sStageDone = done; sStageTotal = total
+                    if (name.isEmpty()) { meter.reset(SystemClock.elapsedRealtime(), 0, 0); sDone = 0; sFilesDone = 0 }
+                    push(done >= total || name.isEmpty())
                 }
-                override fun files(done: Long, total: Long) {
-                    curFiles = done
-                    push(done >= total) { it.copy(filesDone = done, filesTotal = total) }
+                override fun files(done: Long, total: Long) = synchronized(lock) {
+                    sFilesDone = done; sFilesTotal = total
+                    push(done >= total)
                 }
-                override fun update(file: String, done: Long, total: Long) {
-                    curBytes = done
-                    push(done >= total) { it.copy(file = file, done = done, total = total) }
+                override fun update(file: String, done: Long, total: Long) = synchronized(lock) {
+                    sFile = file; sDone = done; sTotal = total
+                    push(done >= total)
                 }
                 override fun cancelled() = Extractor.cancelFlag
             }

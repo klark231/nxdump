@@ -93,6 +93,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
         val pool = Executors.newFixedThreadPool(minOf(DIR_THREADS, wanted.size)) { r -> Thread(r, "nxdump-mkdir").apply { isDaemon = true } }
         val doneLock = Any()
         var done = 0L
+        var open = true                     // closed on exit so a straggler task can't publish into a later extraction
         try {
             for ((_, level) in levels) {
                 val fs = level.map { d ->
@@ -101,7 +102,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
                         val parent = synchronized(lock) { dirs[d.substringBeforeLast('/', "")] } ?: throw IOException("Missing parent of $d")
                         val u = create(parent, DocumentsContract.Document.MIME_TYPE_DIR, d.substringAfterLast('/'))
                         synchronized(lock) { dirs[d] = u }
-                        synchronized(doneLock) { done++; prog.stage("Creating folders", done, total) }
+                        synchronized(doneLock) { if (open) { done++; prog.stage("Creating folders", done, total) } }
                     }
                 }
                 try {
@@ -111,6 +112,7 @@ class SafSink(ctx: Context, private val tree: Uri, wantedName: String) : NamedSi
                 }
             }
         } finally {
+            synchronized(doneLock) { open = false }
             pool.shutdownNow()
         }
         Log.i("SafSink", "prepared $total folders in ${levels.size} levels, ${SystemClock.elapsedRealtime() - t0}ms")
