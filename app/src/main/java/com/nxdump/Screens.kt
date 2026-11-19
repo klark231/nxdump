@@ -36,6 +36,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
@@ -124,6 +125,12 @@ fun rememberPickers(vm: AppViewModel): Pickers {
     }
 }
 
+fun fmtEta(s: Long): String = when {
+    s >= 3600 -> "${s / 3600}h ${s % 3600 / 60}m"
+    s >= 60 -> "${s / 60}m ${s % 60}s"
+    else -> "${s}s"
+}
+
 fun fmtSize(b: Long): String = when {
     b >= 1L shl 30 -> "%.2f GB".format(b / 1073741824.0)
     b >= 1L shl 20 -> "%.1f MB".format(b / 1048576.0)
@@ -154,6 +161,19 @@ fun NxApp(vm: AppViewModel) {
                 SettingsScreen(vm, pickers, snack)
             }
         }
+        if (vm.showDirectPrompt && vm.setupDone) AlertDialog(
+            onDismissRequest = { vm.dismissDirectPrompt() },
+            icon = { Icon(Icons.Default.Bolt, null) },
+            title = { Text("Extract much faster") },
+            text = {
+                Text(
+                    "NxDump can now write straight to your storage instead of going through Android\u2019s document provider, " +
+                        "which slows down badly on games with many files. It needs \u201CAll files access\u201D, granted once in Settings."
+                )
+            },
+            confirmButton = { TextButton(onClick = { vm.dismissDirectPrompt(); DirectAccess.openSettings(ctx) }) { Text("Open settings") } },
+            dismissButton = { TextButton(onClick = { vm.dismissDirectPrompt() }) { Text("Not now") } },
+        )
         ExtractDialog()
     }
 }
@@ -222,8 +242,10 @@ fun StepPage(icon: ImageVector, title: String, body: String, content: @Composabl
 
 @Composable
 fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
+    val ctx = LocalContext.current
     var step by remember { mutableIntStateOf(0) }
     val canNext = when (step) { 1 -> vm.keysSummary != null; 3 -> vm.outputName != null; else -> true }
+    val last = 4
     Scaffold(
         containerColor = Color.Transparent,
         snackbarHost = { SnackbarHost(snack) },
@@ -233,14 +255,14 @@ fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
                 horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (step > 0) TextButton(onClick = { step-- }) { Text("Back") } else Spacer(Modifier.size(1.dp))
-                Button(onClick = { if (step < 3) step++ else vm.finishSetup() }, enabled = canNext) {
-                    Text(if (step == 0) "Get started" else if (step < 3) "Next" else "Finish")
+                Button(onClick = { if (step < last) step++ else vm.finishSetup() }, enabled = canNext) {
+                    Text(if (step == 0) "Get started" else if (step < last) "Next" else "Finish")
                 }
             }
         },
     ) { pad ->
         Column(Modifier.padding(pad).padding(horizontal = 24.dp).verticalScroll(rememberScrollState())) {
-            LinearProgressIndicator(progress = { (step + 1) / 4f }, Modifier.fillMaxWidth().padding(top = 16.dp))
+            LinearProgressIndicator(progress = { (step + 1) / (last + 1f) }, Modifier.fillMaxWidth().padding(top = 16.dp))
             AnimatedContent(step, label = "step") { s ->
                 when (s) {
                     0 -> StepPage(
@@ -266,6 +288,19 @@ fun Wizard(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
                             "You can skip this and add files one by one later.",
                     ) {
                         PickerCard("Game folder", "Optional", vm.gamesName, if (vm.gamesName == null) "Select" else "Change", pickers.gamesFolder)
+                    }
+                    4 -> StepPage(
+                        Icons.Default.Bolt, "Fast file access",
+                        if (Build.VERSION.SDK_INT < 30) "Your Android version writes files directly already \u2014 nothing to do here."
+                        else "Games with thousands of files can take hours through Android\u2019s document provider, and get slower the more it writes. " +
+                            "Allowing \u201CAll files access\u201D lets NxDump write plain files instead, which is far faster. " +
+                            "It\u2019s used only for your output folder, and you can change it later in Settings.",
+                    ) {
+                        if (Build.VERSION.SDK_INT >= 30) {
+                            if (vm.directGranted) Text("\u2713 All files access allowed", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleMedium)
+                            else Button(onClick = { DirectAccess.openSettings(ctx) }, Modifier.fillMaxWidth()) { Text("Allow all files access") }
+                            if (!vm.directGranted) Text("You can skip this; extraction will then use the slower method.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                     else -> StepPage(
                         Icons.Default.FolderOpen, "Output folder",
@@ -528,11 +563,21 @@ fun ExtractDialog() {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(st.title, fontWeight = FontWeight.SemiBold)
                 when (st.phase) {
-                    Phase.RUNNING -> {
+                    Phase.RUNNING -> if (st.stage.isNotEmpty()) {
+                        // setup phase: reading metadata, creating folders…
+                        if (st.stageTotal > 0) LinearProgressIndicator(progress = { st.stageDone / st.stageTotal.toFloat() }, Modifier.fillMaxWidth())
+                        else LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text(if (st.stageTotal > 0) "${st.stage}  \u00B7  ${st.stageDone} / ${st.stageTotal}" else st.stage)
+                    } else {
                         val frac = if (st.total > 0) st.done / st.total.toFloat() else 0f
                         if (st.total > 0) LinearProgressIndicator(progress = { frac }, Modifier.fillMaxWidth())
                         else LinearProgressIndicator(Modifier.fillMaxWidth())
                         Text("${fmtSize(st.done)} / ${fmtSize(st.total)}  \u00B7  ${(frac * 100).toInt()}%")
+                        Text("Files ${st.filesDone} / ${st.filesTotal}")
+                        if (st.bytesPerSec > 0 || st.filesPerSec > 0) Text(
+                            "%.1f files/s  \u00B7  %s/s".format(st.filesPerSec, fmtSize(st.bytesPerSec.toLong())) +
+                                if (st.etaSec >= 0) "  \u00B7  ${fmtEta(st.etaSec)} left" else "",
+                        )
                         Text(
                             st.file, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -600,6 +645,30 @@ fun SettingsScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState)
                     "being written. Lower it if extraction stalls, your phone gets hot, or your storage can't keep up.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            SectionLabel("Direct file access")
+            val context = LocalContext.current
+            ListItem(
+                headlineContent = { Text("Write with plain files (much faster)") },
+                supportingContent = {
+                    Text(
+                        when {
+                            !vm.directGranted -> "Needs \u201CAll files access\u201D. Without it, every file and folder goes through Android\u2019s slow document provider."
+                            !vm.directPathOk -> "Your output folder can\u2019t be reached directly (not on device storage / SD card), so the document provider is used."
+                            vm.directAccess -> "On \u2014 extraction writes straight to your output folder."
+                            else -> "Off \u2014 using the document provider."
+                        },
+                    )
+                },
+                trailingContent = { Switch(checked = vm.directAccess, onCheckedChange = { vm.changeDirect(it) }) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+            )
+            if (!vm.directGranted && Build.VERSION.SDK_INT >= 30) OutlinedButton(
+                onClick = {
+                    try { context.startActivity(DirectAccess.requestIntent(context)) }
+                    catch (e: Exception) { context.startActivity(DirectAccess.fallbackIntent()) }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Grant All files access") }
             SectionLabel("Library")
             ListItem(
                 headlineContent = { Text("Individually added files") },

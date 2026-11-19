@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -22,11 +23,31 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class Dumper {
     private Dumper() {}
 
-    public interface Sink { OutputStream open(String relativePath) throws IOException; }
+    public interface Sink {
+        OutputStream open(String relativePath) throws IOException;
+
+        /** Creates an empty file. Sinks where opening a stream is expensive (SAF) can skip the stream. */
+        default void createEmpty(String relativePath) throws IOException { open(relativePath).close(); }
+
+        /**
+         * Called once with every file path before any copying starts, so a sink can create its directory tree
+         * up front instead of under contention. May report through prog.stage() from several threads.
+         */
+        default void prepare(List<String> relativePaths, Progress prog) throws IOException { }
+    }
 
     public interface Progress {
         void update(String file, long done, long total);
         boolean cancelled();
+
+        /**
+         * A setup phase before/while copying, e.g. "Reading game data" or "Creating folders". total == 0 means
+         * unknown (indeterminate). An empty name means copying has started.
+         */
+        default void stage(String name, long done, long total) { }
+
+        /** Number of files finished so far (called from worker threads, serialised). */
+        default void files(long done, long total) { }
     }
 
     private static final class Job {
@@ -125,15 +146,53 @@ public final class Dumper {
     /**
      * Extracts any mix of ExeFS / RomFS (base, optionally patched by update) and DLC titles.
      * base may be null when only DLC is requested (exefs and romfs both false).
-     * <p>threads = number of files copied in parallel (1 = sequential). With jobs &gt; 1 big files also get a
-     * read-ahead pipeline (decrypt on one thread while the previous chunk is being written on another).
+     * <p>threads = number of big files copied in parallel (1 = fully sequential). With threads &gt; 1 big files also
+     * get a read-ahead pipeline (decrypt on one thread while the previous chunk is being written on another), and
+     * files under 256 KiB are handled by a separate lane of max(8, 3 &times; threads) workers (at most 16) running
+     * alongside, because their cost is per-file latency (create/open), not bytes. So the total number of files in
+     * flight can exceed {@code threads}.
      * Sink.open() may be called from several threads at once and must be thread-safe when threads &gt; 1.
      */
     public static void dump(Container base, Container update, long appId, boolean exefs, boolean romfs,
                             List<Dlc> dlc, Keys keys, Sink sink, Progress prog, int threads) throws IOException {
+        prog.stage("Reading game data", 0, 0);
+        // Tickets first, sequentially: cheap, and every task below may rely on any container's titlekeys.
+        if (base != null) base.importTickets(keys);
+        if (update != null) update.importTickets(keys);
+        if (dlc != null) for (Dlc d : dlc) d.container.importTickets(keys);
+
+        // The game and each DLC are independent and mostly wait on reads, so build their file lists side by side.
+        List<Callable<List<Job>>> tasks = new ArrayList<>();
+        if (exefs || romfs) tasks.add(() -> {
+            List<Job> l = new ArrayList<>();
+            addGameJobs(base, update, appId, exefs, romfs, keys, l);
+            return l;
+        });
+        if (dlc != null) for (Dlc d : dlc) tasks.add(() -> {
+            List<Job> l = new ArrayList<>();
+            addDlcJobs(d, keys, l);
+            return l;
+        });
         List<Job> jobs = new ArrayList<>();
-        if (exefs || romfs) addGameJobs(base, update, appId, exefs, romfs, keys, jobs);
-        if (dlc != null) for (Dlc d : dlc) addDlcJobs(d, keys, jobs);
+        if (threads > 1 && tasks.size() > 1) {
+            ExecutorService ex = Executors.newFixedThreadPool(Math.min(tasks.size(), 6), daemons("nxdump-scan"));
+            try {
+                List<Future<List<Job>>> fs = new ArrayList<>();
+                for (Callable<List<Job>> t : tasks) fs.add(ex.submit(t));
+                for (Future<List<Job>> f : fs) jobs.addAll(f.get());       // task order = old order; first failure wins
+            } catch (ExecutionException e) {
+                rethrow(e.getCause());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedIOException("Interrupted");
+            } finally {
+                ex.shutdownNow();
+            }
+        } else {
+            for (Callable<List<Job>> t : tasks) {
+                try { jobs.addAll(t.call()); } catch (IOException | RuntimeException e) { throw e; } catch (Exception e) { throw new IOException(e); }
+            }
+        }
         copy(jobs, sink, prog, threads);
     }
 
@@ -183,6 +242,9 @@ public final class Dumper {
     private static final int PIPE_MIN = 4 * CHUNK;
     private static final int PIPE_DEPTH = 4;
     private static final int MAX_THREADS = 16;
+    /** Files below this size go to the "small" lane: their cost is per-file latency (create/open), not bytes. */
+    private static final long SMALL_MAX = 256 * 1024;
+    private static final int SMALL_MAX_THREADS = 16;
 
     private static final class Chunk {
         final byte[] buf; final int len;
@@ -211,52 +273,81 @@ public final class Dumper {
     private static void copy(List<Job> jobs, Sink sink, Progress prog, int threads) throws IOException {
         if (jobs.isEmpty()) throw new NxException("Nothing to extract");
         long total = 0;
-        for (Job j : jobs) total += j.size;
+        List<String> paths = new ArrayList<>(jobs.size());
+        for (Job j : jobs) { total += j.size; paths.add(j.path); }
+        sink.prepare(paths, prog);
+        prog.files(0, jobs.size());
+        prog.stage("", 0, 0);
         threads = Math.max(1, Math.min(threads, MAX_THREADS));
         boolean parallel = threads > 1;
-        List<Job> order = jobs;
-        if (parallel) {                       // biggest first, so the tail isn't one giant file
-            order = new ArrayList<>(jobs);
-            order.sort((a, b) -> Long.compare(b.size, a.size));
-        }
-        ExecutorService readers = parallel ? Executors.newCachedThreadPool(daemons("nxdump-read")) : null;
-        Copier c = new Copier(order, sink, prog, total, readers);
         if (!parallel) {
-            c.runWorker();
-        } else {
-            int workers = Math.min(threads, order.size());
-            ExecutorService pool = Executors.newFixedThreadPool(workers, daemons("nxdump-copy"));
-            try {
-                List<Future<?>> fs = new ArrayList<>();
-                for (int i = 0; i < workers; i++) fs.add(pool.submit(c::runWorker));
-                for (Future<?> f : fs) f.get();
-            } catch (ExecutionException e) {
-                c.fail(e.getCause());
-            } catch (InterruptedException e) {
-                c.fail(new InterruptedIOException("Interrupted"));
-                Thread.currentThread().interrupt();
-            } finally {
-                c.stop = true;
-                pool.shutdownNow();
-                readers.shutdownNow();
-            }
+            Copier c = new Copier(sink, prog, total, null);
+            c.filesTotal = jobs.size();
+            c.runWorker(new Lane(jobs), CHUNK);
+            finish(c, total, prog);
+            return;
         }
+        // Two lanes: big files (biggest first, so the tail isn't one giant file) use `threads` workers with
+        // the read-ahead pipeline; small files are latency-bound so they get their own, wider set of workers
+        // that run alongside.
+        List<Job> big = new ArrayList<>(), small = new ArrayList<>();
+        for (Job j : jobs) (j.size < SMALL_MAX ? small : big).add(j);
+        big.sort((x, y) -> Long.compare(y.size, x.size));
+        ExecutorService readers = Executors.newCachedThreadPool(daemons("nxdump-read"));
+        Copier c = new Copier(sink, prog, total, readers);
+        c.filesTotal = jobs.size();
+        int bigWorkers = Math.min(threads, big.size());
+        int smallWorkers = Math.min(small.size(), Math.min(SMALL_MAX_THREADS, Math.max(8, threads * 3)));
+        ExecutorService pool = Executors.newFixedThreadPool(Math.max(1, bigWorkers + smallWorkers), daemons("nxdump-copy"));
+        try {
+            Lane bigLane = new Lane(big), smallLane = new Lane(small);
+            List<Future<?>> fs = new ArrayList<>();
+            for (int i = 0; i < bigWorkers; i++) fs.add(pool.submit(() -> c.runWorker(bigLane, CHUNK)));
+            for (int i = 0; i < smallWorkers; i++) fs.add(pool.submit(() -> c.runWorker(smallLane, (int) SMALL_MAX)));
+            for (Future<?> f : fs) f.get();
+        } catch (ExecutionException e) {
+            c.fail(e.getCause());
+        } catch (InterruptedException e) {
+            c.fail(new InterruptedIOException("Interrupted"));
+            Thread.currentThread().interrupt();
+        } finally {
+            c.stop = true;
+            pool.shutdownNow();
+            readers.shutdownNow();
+        }
+        finish(c, total, prog);
+    }
+
+    private static void finish(Copier c, long total, Progress prog) throws IOException {
         Throwable t = c.failure.get();
         if (t != null) rethrow(t);
         prog.update("", total, total);
     }
 
+    /** A queue of jobs that several workers pull from. */
+    private static final class Lane {
+        final List<Job> jobs; final AtomicInteger next = new AtomicInteger();
+        Lane(List<Job> jobs) { this.jobs = jobs; }
+    }
+
     private static final class Copier {
-        final List<Job> jobs; final Sink sink; final Progress prog; final long total;
+        final Sink sink; final Progress prog; final long total;
         final ExecutorService readers;                 // null = no read-ahead pipelines
-        final AtomicInteger next = new AtomicInteger();
         final AtomicLong done = new AtomicLong();
+        final AtomicInteger filesDone = new AtomicInteger();
+        int filesTotal;
         final AtomicReference<Throwable> failure = new AtomicReference<>();
         final Object progLock = new Object();
         volatile boolean stop;
 
-        Copier(List<Job> jobs, Sink sink, Progress prog, long total, ExecutorService readers) {
-            this.jobs = jobs; this.sink = sink; this.prog = prog; this.total = total; this.readers = readers;
+        Copier(Sink sink, Progress prog, long total, ExecutorService readers) {
+            this.sink = sink; this.prog = prog; this.total = total; this.readers = readers;
+        }
+
+        void fileDone() {
+            synchronized (progLock) {                      // count and publish in the same order: callbacks never go backwards
+                prog.files(filesDone.incrementAndGet(), filesTotal);
+            }
         }
 
         void fail(Throwable t) { failure.compareAndSet(null, t); stop = true; }
@@ -267,16 +358,19 @@ public final class Dumper {
             synchronized (progLock) { prog.update(file, done.get(), total); }
         }
 
-        void runWorker() {
-            byte[] buf = new byte[CHUNK];
-            Pipe pipe = readers != null ? new Pipe() : null;
+        void runWorker(Lane lane, int bufSize) {
+            byte[] buf = new byte[bufSize];
+            Pipe pipe = readers != null && bufSize == CHUNK ? new Pipe() : null;
             try {
                 for (;;) {
                     if (stop) return;
-                    int i = next.getAndIncrement();
-                    if (i >= jobs.size()) return;
-                    Job j = jobs.get(i);
+                    int i = lane.next.getAndIncrement();
+                    if (i >= lane.jobs.size()) return;
+                    Job j = lane.jobs.get(i);
+                    if (prog.cancelled()) throw new InterruptedIOException("Cancelled");
+                    if (j.size == 0) { report(j.path, 0); sink.createEmpty(j.path); fileDone(); continue; }
                     if (pipe != null && j.size >= PIPE_MIN) copyPipelined(j, pipe); else copyPlain(j, buf);
+                    if (!stop) fileDone();
                 }
             } catch (Throwable t) {
                 fail(t);

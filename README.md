@@ -25,7 +25,9 @@ Output: `<Output folder>/<Game> [TITLEID] (+ update) (+ DLC)/exefs/…`, `/romfs
 
 ## Speed
 **Settings → Performance → Parallel jobs** copies several files at once (default: up to 4, max = CPU cores). With more than one job,
-files over 4 MiB also use a read-ahead pipeline (one thread decrypts while another writes). 1 job = the old sequential behaviour.
+files over 4 MiB also use a read-ahead pipeline (one thread decrypts while another writes), and small files (under 256 KiB) are
+copied by a separate, wider set of workers (8–16), since their cost is per-file latency rather than bytes — so the setting limits
+big-file concurrency, not the total. 1 job = the old sequential behaviour.
 Output is byte-identical either way; `core/test/run_tests.sh` checks 1 and 4 jobs, plus error/cancel handling.
 
 ## Notes / limits

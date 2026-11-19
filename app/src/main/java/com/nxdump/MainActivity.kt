@@ -9,6 +9,11 @@ import androidx.activity.viewModels
 class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
 
+    override fun onResume() {
+        super.onResume()
+        vm.refreshDirect()      // the user may just have come back from the "All files access" settings page
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()

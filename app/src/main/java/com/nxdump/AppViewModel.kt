@@ -3,6 +3,7 @@ package com.nxdump
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -28,6 +29,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var gamesName by mutableStateOf<String?>(null); private set
     var outputName by mutableStateOf<String?>(null); private set
     var extraCount by mutableIntStateOf(0); private set
+    var directAccess by mutableStateOf(prefs.directAccess); private set
+    var directGranted by mutableStateOf(DirectAccess.granted()); private set
+    var directPathOk by mutableStateOf(false); private set
+    /** Existing users who updated and never saw the fast-access prompt (new users get it as a setup page). */
+    var showDirectPrompt by mutableStateOf(false); private set
     val maxJobs = Prefs.maxJobs
     var jobs by mutableIntStateOf(prefs.jobs); private set
 
@@ -52,7 +58,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         gamesName = prefs.gamesTree?.let { Library.treeName(ctx, it) ?: "Selected folder" }
         outputName = prefs.outputTree?.let { Library.treeName(ctx, it) ?: "Selected folder" }
         extraCount = prefs.extraFiles.size
+        refreshDirect()
     }
+
+    fun refreshDirect() {
+        directGranted = DirectAccess.granted()
+        directPathOk = prefs.outputTree?.let { DirectAccess.resolve(Uri.parse(it)) } != null
+        if (prefs.setupDone && !prefs.directPromptSeen) {
+            if (directGranted || Build.VERSION.SDK_INT < 30) prefs.directPromptSeen = true else showDirectPrompt = true
+        }
+    }
+
+    fun dismissDirectPrompt() { prefs.directPromptSeen = true; showDirectPrompt = false }
+
+    fun changeDirect(v: Boolean) { directAccess = v; prefs.directAccess = v }
 
     fun changeJobs(v: Int) { jobs = v.coerceIn(1, maxJobs); prefs.jobs = jobs }
 
@@ -99,6 +118,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun finishSetup() {
         prefs.setupDone = true
+        prefs.directPromptSeen = true
+        if (directGranted) changeDirect(true)
         setupDone = true
         rescan()
     }
